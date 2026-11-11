@@ -1,5 +1,6 @@
 """音乐搜索模块 - 基于 go-music-dl"""
 import asyncio
+import json
 import logging
 import re
 import socket
@@ -164,8 +165,61 @@ def build_stream_url(song: dict) -> str:
     if cover:
         params["cover"] = cover
 
+    # 千千、汽水等源需要原样带回 extra 才能解析
+    # 搜索结果里是 JSON 字符串，switch_source 返回的是对象，统一成 JSON 字符串
+    extra = song.get("extra", "")
+    if isinstance(extra, (dict, list)):
+        extra = json.dumps(extra, ensure_ascii=False, separators=(",", ":"))
+    if extra:
+        params["extra"] = extra
+
     query_string = urlencode(params)
     return f"{MUSIC_DL_BASE}/download?{query_string}"
+
+
+def source_of_url(url: str) -> str:
+    """从下载地址里取出源名"""
+    try:
+        return parse_qs(urlparse(url).query).get("source", [""])[0]
+    except Exception:
+        return ""
+
+
+def _artist_tokens(text: str) -> set[str]:
+    return {a.strip().lower() for a in re.split(r"[/、,，&+\s]+", text or "") if len(a.strip()) >= 2}
+
+
+async def switch_source(name: str, artist: str, source: str) -> dict | None:
+    """当前源挂了，让 go-music-dl 在其它平台找同名同歌手的可播版本"""
+    if not name or not source:
+        return None
+    params = {"name": name, "artist": artist, "source": source}
+    async with aiohttp.ClientSession() as session:
+        try:
+            async with session.get(f"{MUSIC_DL_LOCAL}/switch_source", params=params,
+                                   timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                if resp.status != 200:
+                    return None
+                data = await resp.json(content_type=None)
+        except Exception as e:
+            logger.debug(f"换源失败: {name} - {e}")
+            return None
+
+        if not data.get("id") or not data.get("source") or data.get("source") == source:
+            return None
+        # 换源结果不一定靠谱，名字必须完全一致，歌手要有交集
+        if _norm(data.get("name", "")) != _norm(name):
+            logger.info(f"换源结果不是同一首，丢弃: {data.get('name')} - {data.get('artist')}")
+            return None
+        if artist and not (_artist_tokens(artist) & _artist_tokens(data.get("artist", ""))):
+            logger.info(f"换源歌手不一致，丢弃: {data.get('name')} - {data.get('artist')}")
+            return None
+        if not await _song_playable(session, data):
+            return None
+        hit = await check_song_available(session, data)
+        if not hit:
+            return None
+        return {"url": hit[0], "name": data.get("name"), "artist": data.get("artist")}
 
 
 def prefer_mp3_url(url: str) -> str:
@@ -180,23 +234,67 @@ def prefer_mp3_url(url: str) -> str:
     return url
 
 
+async def _inspect_song(session: aiohttp.ClientSession, song: dict) -> dict | None:
+    """调 go-music-dl 的 inspect，拿到解析结果（是否可用、是否只有试听片段）
+
+    v1.1.4 起提供；旧版本或接口异常时返回 None，退回原来的探测逻辑。
+    """
+    try:
+        params = {"id": song.get("id", ""), "source": song.get("source", "")}
+        async with session.get(f"{MUSIC_DL_LOCAL}/inspect", params=params,
+                               timeout=aiohttp.ClientTimeout(total=3)) as resp:
+            if resp.status != 200:
+                return None
+            return await resp.json(content_type=None)
+    except Exception as e:
+        logger.debug(f"inspect 失败: {song.get('name')} - {e}")
+        return None
+
+
+async def _probe_type(session: aiohttp.ClientSession, url: str) -> str | None:
+    """取 1 个字节，返回 Content-Type（小写）"""
+    try:
+        async with session.get(url, headers={"Range": "bytes=0-0"},
+                               timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            if resp.status in (200, 206):
+                return resp.headers.get("Content-Type", "").lower()
+    except Exception as e:
+        logger.debug(f"探测音频失败: {url[:60]} - {e}")
+    return None
+
+
+def _ctype_is_mp3(ctype: str) -> bool:
+    return "mpeg" in ctype or "mp3" in ctype
+
+
 async def check_song_available(session: aiohttp.ClientSession, song: dict) -> tuple[str, str, str, bool] | None:
     """检查歌曲是否可用，返回 (url, name, source, 是否 MP3)"""
     url = prefer_mp3_url(build_stream_url(song))
     name = f"{song.get('name', '')} - {song.get('artist', '')}"
     source = song.get('source', '')
-    
-    try:
-        headers = {"Range": "bytes=0-0"}
-        async with session.get(url, headers=headers, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status in (200, 206):
-                ctype = resp.headers.get("Content-Type", "").lower()
-                is_mp3 = "mpeg" in ctype or "mp3" in ctype
-                return url, name, source, is_mp3
-    except Exception as e:
-        logger.debug(f"检查歌曲失败: {name} - {e}")
-    
-    return None
+
+    ctype = await _probe_type(session, url)
+    if not ctype:
+        return None
+    return url, name, source, _ctype_is_mp3(ctype)
+
+
+async def _song_playable(session: aiohttp.ClientSession, song: dict) -> bool:
+    """选中的候选再确认一次：源解析成功、不是只有试听片段
+
+    放在选定之后调用，避免给每个候选都多发一次请求。
+    """
+    info = await _inspect_song(session, song)
+    if info is None:
+        return True  # 旧版本或接口异常，按原来的逻辑放行
+    name = f"{song.get('name', '')} - {song.get('artist', '')}"
+    if info.get("status") != "valid":
+        logger.info(f"源解析失败，跳过: {name} (源: {song.get('source')})")
+        return False
+    if info.get("preview_only"):
+        logger.info(f"只有试听片段，跳过: {name} (源: {song.get('source')})")
+        return False
+    return True
 
 
 async def _check_group(songs: list[dict]) -> tuple[tuple[str, str, str, bool] | None, tuple[str, str, str, bool] | None]:
@@ -204,47 +302,57 @@ async def _check_group(songs: list[dict]) -> tuple[tuple[str, str, str, bool] | 
     async with aiohttp.ClientSession() as session:
         results = await asyncio.gather(*[check_song_available(session, s) for s in songs], return_exceptions=True)
 
-    mp3_hit = None
-    fallback = None
-    for result in results:
-        if isinstance(result, Exception) or result is None:
-            continue
-        if result[3] and mp3_hit is None:
-            mp3_hit = result
-        elif not result[3] and fallback is None:
-            fallback = result
-    return mp3_hit, fallback
+        usable = []
+        for song, result in zip(songs, results):
+            if isinstance(result, Exception) or result is None:
+                continue
+            usable.append((song, result))
+        # MP3 优先，再按原来的候选顺序
+        usable.sort(key=lambda item: not item[1][3])
+
+        # 先只确认 MP3 候选，避免为整条兜底链都多发 inspect 请求
+        for song, result in usable:
+            if result[3] and await _song_playable(session, song):
+                return result, None
+        for song, result in usable:
+            if not result[3] and await _song_playable(session, song):
+                return None, result
+        return None, None
 
 
 def _artist_list(song: dict) -> list[str]:
     return [a.strip().lower() for a in re.split(r"[/、,，&+\s]+", song.get("artist", "")) if len(a.strip()) >= 2]
 
 
-def _early_candidate(songs: list[dict], keyword: str) -> list[dict] | None:
-    """候选是否足够靠谱到可以提前开播：标题完全一致、不是 Live/翻唱等版本、歌手已有多源印证"""
+def _pool_confident(songs: list[dict], keyword: str) -> bool:
+    """候选里已经有一首足够像原唱的，就不必再等慢源"""
     if not songs:
-        return None
+        return False
     votes = _artist_votes(songs)
-    ranked = rank_songs(songs, keyword, votes)
-    top = ranked[0]
+    top = rank_songs(songs, keyword, votes)[0]
     name = top.get("name", "")
     if _norm(name) != _norm(keyword) or _BRACKETS.search(name):
-        return None
+        return False
     if any(hint in name.lower() for hint in _VERSION_HINTS):
-        return None
+        return False
     try:
         if 0 < int(top.get("duration", 0)) < 180:
-            return None
+            return False
     except (TypeError, ValueError):
         pass
-    if max((votes.get(a, 0) for a in _artist_list(top)), default=0) < 2:
+    return max((votes.get(a, 0) for a in _artist_list(top)), default=0) >= 2
+
+
+def _early_candidate(songs: list[dict], keyword: str) -> list[dict] | None:
+    """候选是否足够靠谱到可以提前开播：标题完全一致、不是 Live/翻唱等版本、歌手已有多源印证"""
+    if not _pool_confident(songs, keyword):
         return None
-    return ranked
+    return rank_songs(songs, keyword, _artist_votes(songs))
 
 
 async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, str] | None:
-    """并发搜索所有源；头 2.5 秒就出现高置信候选时立刻开播，否则等满 4 秒再全局排序"""
-    sources = ["migu", "netease", "qq", "kugou", "bilibili", "kuwo"]  # 咪咕打平时优先
+    """并发搜索所有源；出现高置信候选就提前开播，4 秒后还不够靠谱就再等 3 秒慢源"""
+    sources = ["migu", "netease", "qq", "kugou", "qianqian", "kuwo"]  # 咪咕打平时优先
 
     logger.info(f"并发搜索 {len(sources)} 个源 (优先级: {', '.join(sources)})...")
 
@@ -252,6 +360,7 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
     results: dict[str, list[dict]] = {}
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 4.0
+    hard_deadline = deadline + 3.0
 
     def collect(finished):
         for src, task in zip(sources, tasks):
@@ -264,10 +373,16 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
         pending = set(tasks)
         early_fallback = None
         early_checked = False
-        while pending and loop.time() < deadline:
-            # 边等边看：3 个源返回后先评估一次，够靠谱就立刻开播，慢源继续补齐
+        while pending and loop.time() < hard_deadline:
+            if loop.time() >= deadline:
+                # 已过基础等待时间：候选够靠谱就直接收工，否则再给慢源一点时间
+                pool_now = [s for songs in results.values() for s in songs]
+                if _pool_confident(pool_now, keyword):
+                    break
             done, pending = await asyncio.wait(pending, timeout=0.4)
             collect(done)
+            if loop.time() >= deadline:
+                continue
             if early_checked or len(results) < 3:
                 continue
             early_checked = True
@@ -297,6 +412,11 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
             candidates.append((-_score(song, keyword, votes), sources.index(src), song))
     candidates.sort(key=lambda item: (item[0], item[1]))
 
+    # 全都没沾上标题/歌手（比如搜不存在的歌名时源站的模糊结果），宁可不放
+    if -candidates[0][0] < 30:
+        logger.warning(f"候选和关键词都不匹配，放弃: {keyword}")
+        return None
+
     logger.info(f"候选 {len(candidates)} 首，最优: {candidates[0][2].get('name')} - {candidates[0][2].get('artist')}")
 
     fallback = early_fallback  # 非 MP3 的可播候选，最后兜底
@@ -319,7 +439,7 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
     return None
 
 
-_SOURCE_PRIORITY = ["migu", "kuwo", "qq", "kugou", "netease"]
+_SOURCE_PRIORITY = ["migu", "kuwo", "qq", "kugou", "netease", "qianqian"]
 
 
 async def _pick_mp3(candidates: list[tuple[str, dict]]) -> tuple[str, dict] | None:
@@ -332,17 +452,18 @@ async def _pick_mp3(candidates: list[tuple[str, dict]]) -> tuple[str, dict] | No
         checks = await asyncio.gather(*[
             check_song_available(session, song) for _, song in ordered
         ], return_exceptions=True)
-    for (src, song), hit in zip(ordered, checks):
-        if isinstance(hit, Exception) or not hit:
-            continue
-        if hit[3]:
-            return hit[0], song
+        # 校验必须在 session 关闭前完成
+        for (src, song), hit in zip(ordered, checks):
+            if isinstance(hit, Exception) or not hit:
+                continue
+            if hit[3] and await _song_playable(session, song):
+                return hit[0], song
     return None
 
 
 async def search_artist_tracks(artist: str, limit: int = 8) -> list[tuple[str, str]]:
     """多源找歌手的正曲，只留 MP3 可直接切片的版本"""
-    sources = ["migu", "kuwo", "qq", "kugou", "netease"]
+    sources = ["migu", "kuwo", "qq", "kugou", "netease", "qianqian"]
     raw = await asyncio.gather(*[
         search_songs(artist, source=src, max_results=20) for src in sources
     ], return_exceptions=True)
