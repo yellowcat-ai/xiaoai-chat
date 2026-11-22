@@ -49,6 +49,36 @@ def _frame_info(data: bytes, pos: int):
     return 72 * bitrate // sample_rate + padding, 576 / sample_rate
 
 
+def mp3_duration_head(data: bytes) -> float | None:
+    """从文件头读 Xing/Info 帧数算总时长，没有索引头返回 None"""
+    pos = _id3_size(data)
+    info = _frame_info(data, pos)
+    if info is None:
+        return None
+    frame_len, frame_dur = info
+    hdr = data[pos + 4:pos + 4 + frame_len]
+    marker = hdr.find(b"Xing")
+    if marker < 0:
+        marker = hdr.find(b"Info")
+    if marker < 0 or len(hdr) < marker + 12:
+        return None
+    flags = int.from_bytes(hdr[marker + 4:marker + 8], "big")
+    if not flags & 1:
+        return None
+    frames = int.from_bytes(hdr[marker + 8:marker + 12], "big")
+    return frames * frame_dur if frames else None
+
+
+def mp3_bitrate_head(data: bytes) -> int | None:
+    """第一帧的码率（bps），用来按文件大小估算时长"""
+    pos = _id3_size(data)
+    info = _frame_info(data, pos)
+    if info is None:
+        return None
+    frame_len, frame_dur = info
+    return int(frame_len * 8 / frame_dur)
+
+
 def is_mp3(data: bytes) -> bool:
     if data[:3] == b"ID3":
         return True

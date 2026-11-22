@@ -20,6 +20,7 @@ from segmented_push import (
     fetch_audio_head,
     is_mp3,
     iter_mp3_chunks,
+    mp3_duration_head,
     stream_mp3_chunks,
     transcode_to_mp3,
     write_chunk,
@@ -389,12 +390,16 @@ async def _open_track(track: dict):
         return _async_chunks(iter_mp3_chunks(data, SEGMENT_SECONDS)) if data else None
 
     url = prefer_mp3_url(track["url"])
-    head = await fetch_audio_head(url)
+    head = await fetch_audio_head(url, size=65536)
     if head is None:
         # 探测都拿不到，别再去整段下载（可能要等 3 分钟），直接交给换源逻辑
         logger.warning(f"音频地址不可用，跳过：{track.get('name')}")
         return None
     if is_mp3(head):
+        dur = mp3_duration_head(head)
+        if dur is not None and dur < 45:
+            logger.warning(f"音源疑似试听片段（{dur:.0f} 秒），换源：{track.get('name')}")
+            return None
         return stream_mp3_chunks(url, SEGMENT_SECONDS)
 
     logger.info(f"{track.get('name')} 不是 MP3，下载后转码（约 6-10 秒）")

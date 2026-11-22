@@ -9,6 +9,8 @@ from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
 import aiohttp
 
+from segmented_push import mp3_bitrate_head, mp3_duration_head
+
 logger = logging.getLogger(__name__)
 
 
@@ -79,7 +81,7 @@ _BRACKETS = re.compile(r"[（(\[【].*?[）)\]】]")
 _VERSION_HINTS = (
     "伴奏", "伴唱", "翻唱", "cover", "live", "演唱会", "片段", "铃声", "dj", "remix",
     "纯音乐", "钢琴", "吉他", "口琴", "童声", "女声版", "男声版", "加速", "降调", "慢速",
-    "见面会", "现场版", "音乐节",
+    "见面会", "现场版", "音乐节", "音乐会", "现场", "巡演",
 )
 
 
@@ -262,16 +264,39 @@ async def _inspect_song(session: aiohttp.ClientSession, song: dict) -> dict | No
         return None
 
 
-async def _probe_type(session: aiohttp.ClientSession, url: str) -> str | None:
-    """取 1 个字节，返回 Content-Type（小写）"""
+async def _probe_head(session: aiohttp.ClientSession, url: str) -> tuple[str, float | None, int | None] | None:
+    """取文件头，返回 (Content-Type 小写, 时长, 文件总字节)；读不到的项为 None"""
     try:
-        async with session.get(url, headers={"Range": "bytes=0-0"},
-                               timeout=aiohttp.ClientTimeout(total=5)) as resp:
-            if resp.status in (200, 206):
-                return resp.headers.get("Content-Type", "").lower()
+        async with session.get(url, headers={"Range": "bytes=0-65535"},
+                               timeout=aiohttp.ClientTimeout(total=6)) as resp:
+            if resp.status not in (200, 206):
+                return None
+            ctype = resp.headers.get("Content-Type", "").lower()
+            total = None
+            offset = resp.headers.get("Content-Range", "")
+            if "/" in offset:
+                try:
+                    total = int(offset.rsplit("/", 1)[1])
+                except ValueError:
+                    total = None
+            elif resp.status == 200:
+                try:
+                    total = int(resp.headers.get("Content-Length", ""))
+                except ValueError:
+                    total = None
+            head = await resp.content.read(65536)
     except Exception as e:
         logger.debug(f"探测音频失败: {url[:60]} - {e}")
-    return None
+        return None
+
+    duration = None
+    if _ctype_is_mp3(ctype):
+        duration = mp3_duration_head(head)
+        if duration is None and total:
+            bitrate = mp3_bitrate_head(head)
+            if bitrate:
+                duration = total * 8 / bitrate
+    return ctype, duration, total
 
 
 def _ctype_is_mp3(ctype: str) -> bool:
@@ -284,8 +309,12 @@ async def check_song_available(session: aiohttp.ClientSession, song: dict) -> tu
     name = f"{song.get('name', '')} - {song.get('artist', '')}"
     source = song.get('source', '')
 
-    ctype = await _probe_type(session, url)
-    if not ctype:
+    probed = await _probe_head(session, url)
+    if not probed:
+        return None
+    ctype, duration, _ = probed
+    if duration is not None and duration < 45:
+        logger.info(f"疑似试听片段（{duration:.0f} 秒），跳过: {name}")
         return None
     return url, name, source, _ctype_is_mp3(ctype)
 
