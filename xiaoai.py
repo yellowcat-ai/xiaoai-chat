@@ -175,11 +175,12 @@ class XiaoAiSpeaker:
         except Exception as e:
             logger.error(f"[{self.name}] TTS 失败: {e}")
 
-    async def play_audio_url(self, url: str):
+    async def play_audio_url(self, url: str, audio_id: str | None = None):
         """通过音乐通道播放音频 URL；网络抖动时重试，避免整首歌中断"""
         for attempt in range(3):
             try:
-                result = await self.service.play_by_music_url(self.device_id, url)
+                kwargs = {"audio_id": audio_id} if audio_id else {}
+                result = await self.service.play_by_music_url(self.device_id, url, **kwargs)
                 logger.info(f"[{self.name}] 音乐通道播放: {url[:80]}... (result={result})")
                 return result
             except Exception as e:

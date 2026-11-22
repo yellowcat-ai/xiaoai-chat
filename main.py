@@ -374,6 +374,16 @@ def _active_entry(device_id: str) -> dict | None:
     return None
 
 
+_audio_seq = 0
+
+
+def _chunk_audio_id(url: str) -> str:
+    """每段用不同 audio_id；必须是 xiaowei 的 19 位格式，音箱才更新播放位置"""
+    global _audio_seq
+    _audio_seq = (_audio_seq + 1) % 1000
+    return f"1582971365183456{_audio_seq:03d}"
+
+
 async def _async_chunks(sync_iter):
     """把同步切片生成器包成异步迭代，边产出边让出事件循环"""
     for item in sync_iter:
@@ -433,6 +443,7 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
         "paused_total": 0.0,
         "skip": False,
         "loop": loop,
+        "guard": None,
     }
     _seg_playback[speaker.device_id] = entry
 
@@ -463,6 +474,55 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
         if not entry["first_ready"].is_set():
             entry["first_ok"] = False
             entry["first_ready"].set()
+
+    async def _pos_at(at: float) -> tuple[int, int] | None:
+        delay = at - time()
+        if delay > 0:
+            await asyncio.sleep(delay)
+        st = await speaker.get_status() or {}
+        pos = (st.get("play_song_detail") or {}).get("position")
+        if not isinstance(pos, int) or not isinstance(st.get("status"), int):
+            return None
+        return pos, st["status"]
+
+    def _set_guard(start: float, dur: float):
+        prev = entry.get("guard")
+        if prev and not prev["task"].done():
+            prev["task"].cancel()
+        if dur < 6:
+            entry["guard"] = None
+            return
+        at = start + max(3.0, dur * 0.4)
+        entry["guard"] = {
+            "task": asyncio.create_task(_pos_at(at)),
+            "taken": at,
+            "paused": entry["paused_total"],
+        }
+
+    async def _externally_stopped() -> bool:
+        """推下一段前比较两次播放位置；没往前走说明用户手动停了音箱"""
+        g = entry.get("guard")
+        if not g or g["paused"] != entry["paused_total"] or g["task"].cancelled():
+            return False
+        try:
+            mid = await asyncio.wait_for(g["task"], timeout=5.0)
+        except (asyncio.TimeoutError, Exception):
+            return False
+        if mid is None:
+            return False
+        now = await _pos_at(0)
+        if now is None:
+            return False
+        mid_pos, _ = mid
+        now_pos, now_status = now
+        delta = now_pos - mid_pos
+        expected = max(2000.0, (time() - g["taken"]) * 500.0)
+        # 音箱播完一段会自动从头重放，位置归零属于正常；只有原地不动才是被停了
+        logger.debug(
+            f"[{speaker.name}] 播放位置 {mid_pos} → {now_pos} "
+            f"status={now_status}（阈值 {expected:.0f}）"
+        )
+        return now_status != 1 and 0 <= delta < expected
 
     cache_state = {"done": False}
     prep_seq = 0
@@ -529,7 +589,11 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                 if pushed == 0:
                     if start_at is not None and not await wait_target(start_at):
                         return None
-                    ok = await speaker.play_audio_url(chunk_url)
+                    if start_at is not None and await _externally_stopped():
+                        logger.info(f"[{speaker.name}] 音箱已被手动停止，不再续播")
+                        entry["cancelled"] = True
+                        return None
+                    ok = await speaker.play_audio_url(chunk_url, audio_id=_chunk_audio_id(chunk_url))
                     push_at = time()
                     if not ok:
                         return None
@@ -542,7 +606,11 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                     # 上一段播完的瞬间接上这一段，既不空档也不会让它循环
                     if not await wait_target(prev_start + prev_dur - PUSH_LEAD):
                         return None
-                    if not await speaker.play_audio_url(chunk_url):
+                    if await _externally_stopped():
+                        logger.info(f"[{speaker.name}] 音箱已被手动停止，不再续播")
+                        entry["cancelled"] = True
+                        return None
+                    if not await speaker.play_audio_url(chunk_url, audio_id=_chunk_audio_id(chunk_url)):
                         # 已经放出去的部分照常播完，按最后一段的时间点交给下一首
                         logger.warning(f"[{speaker.name}] 第 {pushed + 1} 段推送失败，本首中断")
                         return prev_start, prev_dur
@@ -554,6 +622,7 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                 )
                 prev_dur = dur
                 pushed += 1
+                _set_guard(prev_start, prev_dur)
 
             if pushed == 0:
                 return None
@@ -688,6 +757,9 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                 _, prefetch_task = prefetched
                 if not prefetch_task.done():
                     prefetch_task.cancel()
+            guard = entry.get("guard")
+            if guard and not guard["task"].done():
+                guard["task"].cancel()
             cleanup_chunks(prefix)
             if _seg_playback.get(speaker.device_id) is entry:
                 _seg_playback.pop(speaker.device_id, None)
