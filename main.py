@@ -391,6 +391,12 @@ async def _open_track(track: dict):
 
     url = prefer_mp3_url(track["url"])
     head = await fetch_audio_head(url, size=65536)
+    for delay in (0.8, 2.0):
+        if head is not None:
+            break
+        # 音乐源的签名地址会间歇性 404，隔一会儿再试通常能拿到
+        await asyncio.sleep(delay)
+        head = await fetch_audio_head(url, size=65536)
     if head is None:
         # 探测都拿不到，别再去整段下载（可能要等 3 分钟），直接交给换源逻辑
         logger.warning(f"音频地址不可用，跳过：{track.get('name')}")
@@ -836,8 +842,16 @@ async def _poll_loop(speaker: XiaoAiSpeaker, processed: set, state: dict):
                             played = await _start_segmented(
                                 speaker, tracks, title, cache_key, loop=loop_mode
                             )
-                            if not played and tracks[0].get("url"):
-                                played = await speaker.play_audio_url(tracks[0]["url"])
+                            if not played:
+                                # 第三方直链有 60 秒上限，不能当兜底；重新解析拿新地址再走分段
+                                logger.warning(f"[{speaker.name}] 分段播放未就绪，重新解析音源")
+                                tracks2, title2, cache_key2 = await _resolve_tracks(
+                                    music_keyword, artist_intent
+                                )
+                                if tracks2:
+                                    played = await _start_segmented(
+                                        speaker, tracks2, title2, cache_key2, loop=loop_mode
+                                    )
                             if played:
                                 logger.info(f"[{speaker.name}] 开始播放：{title}")
                             else:
