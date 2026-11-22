@@ -12,6 +12,10 @@ $NotifyPort = 8787
 $MusicDl    = 'D:\workspace-wuyc\go-music-dl\music-dl.exe'
 $MusicDlDir = Split-Path -Parent $MusicDl
 
+# 夜间停机时段：23:00-07:00 不运行主程序（避免循环播放夜里响）
+$now   = Get-Date
+$quiet = ($now.Hour -ge 23) -or ($now.Hour -lt 7)
+
 # Only one watchdog instance at a time.
 $mutex = New-Object System.Threading.Mutex($false, 'Local\XiaoAiChatWatchdog')
 if (-not $mutex.WaitOne(1000)) { exit 0 }
@@ -46,6 +50,17 @@ try {
 
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |
                Where-Object { $_.CommandLine -match 'main\.py' })
+
+    if ($quiet) {
+        if ($procs.Count -gt 0) {
+            $ids = ($procs | ForEach-Object { $_.ProcessId }) -join ','
+            $procs | ForEach-Object { Stop-Process -Id $_.ProcessId -Force }
+            Write-WdLog ("quiet hours -> stopped pid={0}" -f $ids)
+        } else {
+            Write-WdLog 'quiet hours (23:00-07:00), skip start'
+        }
+        exit 0
+    }
 
     if ($procs.Count -gt 0) {
         $ids = ($procs | ForEach-Object { $_.ProcessId }) -join ','
