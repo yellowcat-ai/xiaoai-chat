@@ -10,6 +10,7 @@ nohup.out
 nohup.out.*
 watchdog-run-*
 song_cache/
+song_intent_cache.json
 local_music/
 test_*.mp3
 *.flac

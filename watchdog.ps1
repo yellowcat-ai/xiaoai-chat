@@ -1,4 +1,4 @@
-# XiaoAi Chat watchdog.
+﻿# XiaoAi Chat watchdog.
 # Scheduled every 5 minutes by Windows Task Scheduler (task name: XiaoAiChatWatchdog).
 # If main.py is not running, start it again.
 
@@ -9,6 +9,8 @@ $Entry      = Join-Path $ProjectDir 'main.py'
 $Python     = Join-Path $env:LOCALAPPDATA 'Programs\Python\Python312\python.exe'
 $LogPath    = Join-Path $ProjectDir 'watchdog.log'
 $NotifyPort = 8787
+$MusicDl    = 'D:\workspace-wuyc\go-music-dl\music-dl.exe'
+$MusicDlDir = Split-Path -Parent $MusicDl
 
 # Only one watchdog instance at a time.
 $mutex = New-Object System.Threading.Mutex($false, 'Local\XiaoAiChatWatchdog')
@@ -23,6 +25,23 @@ try {
     # Rotate the log so it cannot grow forever.
     if ((Test-Path -LiteralPath $LogPath) -and ((Get-Item -LiteralPath $LogPath).Length -gt 2MB)) {
         Move-Item -LiteralPath $LogPath -Destination ($LogPath + '.1') -Force
+    }
+
+    # go-music-dl 是在线点歌的搜索后端，掉了会让所有点歌失败
+    $music = @(Get-CimInstance Win32_Process -Filter "Name='music-dl.exe'")
+    if ($music.Count -eq 0 -and (Test-Path -LiteralPath $MusicDl)) {
+        Start-Process -FilePath $MusicDl -ArgumentList 'web --no-browser' `
+            -WorkingDirectory $MusicDlDir -WindowStyle Hidden `
+            -RedirectStandardOutput (Join-Path $MusicDlDir 'music-dl.out') `
+            -RedirectStandardError (Join-Path $MusicDlDir 'music-dl.err') | Out-Null
+        Start-Sleep -Seconds 2
+        $music = @(Get-CimInstance Win32_Process -Filter "Name='music-dl.exe'")
+        if ($music.Count -gt 0) {
+            $musicIds = ($music | ForEach-Object { $_.ProcessId }) -join ','
+            Write-WdLog ("music-dl DOWN -> restarted, pid={0}" -f $musicIds)
+        } else {
+            Write-WdLog 'ERROR music-dl restart failed'
+        }
     }
 
     $procs = @(Get-CimInstance Win32_Process -Filter "Name='python.exe'" |

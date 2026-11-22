@@ -16,3 +16,6 @@ LLM_SYSTEM_PROMPT = os.getenv(
 )
 
 POLL_INTERVAL = float(os.getenv("POLL_INTERVAL", "1.5"))
+
+# 播报接口端口；token 由 secrets-manager 的 xiaoai_notify_token 提供
+NOTIFY_PORT = int(os.getenv("NOTIFY_PORT", "8787"))

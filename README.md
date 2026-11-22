@@ -105,12 +105,60 @@ GET /music/inspect?id=...&source=...                      返回解析结果（J
 - 第三方链接有 60 秒上限，所以一首歌会切成约 50 秒一段依次推送，按音箱真实拉流时刻对齐
 - 歌单播放时会预取下一首，切歌不需要重新等待
 - 听过的歌缓存在 `song_cache/`（默认 7 天、400MB），再点一次跳过搜索
+- 说"单曲循环播放小兔子乖乖"或"小兔子乖乖单曲循环"会循环播放，说"取消循环"则当前这首播完停止
+- "灌篮高手主题曲"这类描述性说法会先让大模型推断正式歌名（如《好想大声说爱你》）再搜索；普通歌名直接搜，不额外调用；推断结果缓存在 `song_intent_cache.json`
 
-### 4. 前置条件
+### 4. 本地点播库（可选）
+
+儿歌、故事这类在线源经常搜不准（同名翻唱、音源张冠李戴），可以直接放本地文件，播放时完全不查在线搜索。
+
+把文件放到项目的 `local_music/` 目录，**文件名就是点播词**：
+
+```
+local_music/小兔子乖乖 - 贝乐虎儿歌.mp3
+local_music/数鸭子 - 贝乐虎儿歌.mp3
+```
+
+- 说"播放小兔子乖乖"、"贝乐虎儿歌的小兔子乖乖"都会命中第一条（带前缀、带"这首歌"的说法也认）
+- 文件名写成 `歌名 - 歌手` 时，"歌手"会记进播放信息，日志里也能看到
+- 支持 mp3 / flac / wav；flac、wav 会自动转码后切片
+- 本地命中优先于缓存和在线搜索，不会因为网络或音源问题放错歌
+- 本地歌曲同样支持"单曲循环播放…"和"取消循环"
+
+### 5. 前置条件
 
 - 音箱和电脑同一局域网，防火墙要放行 Python 的监听端口（程序会自动起一个 HTTP 服务给音箱拉流，端口随机）
 - 不是所有歌都能拿到，会员或版权受限的通常只有试听
 - 音频来自公开渠道，仅供自己听，不要二次分发
+
+## 播报接口（可选）
+
+主程序会在本地 `8787` 端口开一个带 token 的 HTTP 接口，让脚本、手机快捷指令主动叫音箱说话，不用先喊"小爱同学"。
+
+token 存放在 secrets-manager，名字是 `xiaoai_notify_token`（没有就跳过这个服务启动，不影响聊天和点歌）。取名用：
+
+```bash
+node ~/.secrets-manager/secrets.js get xiaoai_notify_token
+```
+
+调用示例：
+
+```bash
+curl -X POST http://localhost:8787/notify \
+  -H "X-Notify-Token: $TOKEN" -H "Content-Type: application/json" \
+  -d '{"text": "该吃饭了", "device": "客厅"}'
+```
+
+| 字段 | 说明 |
+| --- | --- |
+| `text` | 要播报的文字，最长 300 字；和 `audio_url` 二选一 |
+| `audio_url` | 直接播放一个 http(s) 音频地址 |
+| `device` | 设备名子串（客厅/主卧）或 device_id，不填默认客厅 |
+| `interrupt` | 默认 `true`，会先停掉正在放的音乐；传 `false` 则直接抢占 |
+
+`GET /healthz` 同样需要 token，用来确认服务和设备在线。
+
+出门在外用手机流量访问：电脑上跑 `cloudflared tunnel --url http://localhost:8787`，会得到一个临时的 `https://xxx.trycloudflare.com` 地址，把它配进手机快捷指令（GET/POST + `X-Notify-Token` 头）即可。临时地址每次重启都会变；要固定地址需要 Cloudflare 账号和一个域名，用命名隧道（`cloudflared tunnel login` → `tunnel create` → `route dns`）。
 
 ## 已知限制
 

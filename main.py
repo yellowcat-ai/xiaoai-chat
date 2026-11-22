@@ -14,6 +14,7 @@ from xiaoai import create_speakers, XiaoAiSpeaker
 from llm_client import chat
 from tts_engine import generate_tts, get_silence_url, wait_fetch
 from music_search import search_and_play, search_artist_tracks, prefer_mp3_url, switch_source, source_of_url
+import notify_server
 from segmented_push import (
     fetch_audio,
     fetch_audio_head,
@@ -25,6 +26,9 @@ from segmented_push import (
     cleanup_chunks,
 )
 import song_cache
+import local_music
+import music_aliases
+import song_intent
 
 logging.basicConfig(
     level=logging.INFO,
@@ -79,6 +83,8 @@ async def main():
             skipped += 1
         tasks.append(_poll_loop(s, processed, state))
     logger.info(f"已跳过 {skipped} 条历史对话")
+
+    await notify_server.start(speakers, _notify_text, _notify_audio, config.NOTIFY_PORT)
 
     await asyncio.gather(*tasks, return_exceptions=True)
 
@@ -139,7 +145,10 @@ PLAYLIST_INTENT_PREFIXES = ("来点", "来几首", "放几首", "听几首", "�
 NON_MUSIC_HINTS = ["视频", "电影", "电视", "有声书", "评书", "相声", "新闻", "电台", "广播", "播报"]
 
 # 去掉“放/听”之后只剩这些词，说明是在说“放一下”“来点啥”，不是具体歌名
-_NO_SONG_WORDS = {"一下", "一个", "什么", "啥", "点什么", "随便", "好听", "好听的", "首", "歌"}
+_NO_SONG_WORDS = {
+    "一下", "一个", "什么", "啥", "点什么", "随便", "好听", "好听的", "首", "歌",
+    "这首歌", "那首歌", "这首", "那首",
+}
 
 
 _PLAYLIST_PREFIX_RE = re.compile(
@@ -181,6 +190,34 @@ def _extract_playlist_artist(keyword: str) -> str | None:
     return None
 
 
+_LOOP_PREFIX_RE = re.compile(
+    r"^(?:单曲循环|循环播放|无限循环|循环|一直播放|重复播放)(?:播放|放|听)?\s*(.+)$"
+)
+_LOOP_SUFFIX_RE = re.compile(r"^(.+?)(?:单曲循环|循环播放|循环)$")
+_LOOP_FILLER = {"播放", "放", "听", "循环", "单曲", "单曲循环", "循环播放", "歌曲", "歌"}
+
+
+def _extract_loop_music(query: str) -> tuple[str, bool, bool] | None:
+    """识别“单曲循环播放X / X单曲循环”，返回 (关键词, 是否歌单, 循环)"""
+    q = _POLITE_PREFIX_RE.sub("", query.strip().lstrip("，,。.、 ")).strip()
+    if any(hint in q for hint in NON_MUSIC_HINTS):
+        return None
+    keyword = ""
+    m = _LOOP_PREFIX_RE.match(q)
+    if m:
+        keyword = m.group(1)
+    else:
+        m = _LOOP_SUFFIX_RE.match(q)
+        if m:
+            keyword = m.group(1)
+    keyword = keyword.strip().lstrip("，,。.、 一首首的个歌").strip()
+    if not keyword or keyword in _NO_SONG_WORDS or keyword in _LOOP_FILLER:
+        return None
+    if keyword.startswith(("取消", "停止", "关闭", "别循环", "不用")):
+        return None
+    return keyword, False, True
+
+
 _VOLUME_RE = re.compile(r"(?:音量|声音)(?:调到|调成|设置为|设为|开到|开到)?\s*(\d{1,3})")
 
 
@@ -189,6 +226,8 @@ def _parse_control(query: str) -> dict | None:
     q = query.strip().lstrip("，,。.、 ")
     # 只认短指令，避免“继续讲一下刚才那个”这类聊天被当成播放控制
     if len(q) <= 8:
+        if any(k in q for k in ("取消循环", "停止循环", "关闭循环", "别循环", "不用循环")):
+            return {"action": "unloop"}
         if any(k in q for k in ("下一首", "切歌", "换一首", "换首歌", "跳过这首", "跳过")):
             return {"action": "next"}
         if any(k in q for k in ("继续播放", "接着放", "接着播", "继续放", "继续")):
@@ -220,6 +259,10 @@ async def _handle_control(speaker: XiaoAiSpeaker, ctrl: dict, entry: dict | None
             logger.info(f"[{speaker.name}] 切歌")
         else:
             await speaker.stop_playback()
+    elif action == "unloop":
+        if entry:
+            entry["loop"] = False
+            logger.info(f"[{speaker.name}] 已取消循环，本首播完停止")
     elif action == "pause":
         if entry and not entry["paused"]:
             entry["paused"] = True
@@ -275,9 +318,33 @@ async def _handle_chat(speaker: XiaoAiSpeaker, query: str):
             await speaker.speak("抱歉，我暂时无法回答")
 
 
+async def _notify_text(speaker: XiaoAiSpeaker, text: str, interrupt: bool = True) -> bool:
+    """播报一段文字：先合成，再掐掉正在放的音乐（可选），最后走音乐通道"""
+    result = await generate_tts(text)
+    if interrupt:
+        _cancel_segments(speaker.device_id)
+        await speaker.stop_playback()
+    if not result:
+        # edge-tts 不可用时退回小爱自带 TTS（只在对话模式下有效）
+        await speaker.speak(text)
+        return True
+    audio_url, duration = result
+    ok = await speaker.play_audio_url(audio_url)
+    if ok:
+        _schedule_silence(speaker, duration)
+    return ok
+
+
+async def _notify_audio(speaker: XiaoAiSpeaker, url: str, interrupt: bool = True) -> bool:
+    """直接播放一个音频地址（比如预生成好的提示音）"""
+    if interrupt:
+        _cancel_segments(speaker.device_id)
+        await speaker.stop_playback()
+    return await speaker.play_audio_url(url)
+
+
 # 分段推流参数：每段约 50 秒（低于 60 秒上限），按音箱真实播放起点接力推送
-SEGMENT_SECONDS = 50.0
-# 从下发指令到音箱真正出声约 0.7s（实测：推送→拉流 0.37s，拉流→开播 0.32s），
+SEGMENT_SECONDS = 50.0# 从下发指令到音箱真正出声约 0.7s（实测：推送→拉流 0.37s，拉流→开播 0.32s），
 # 提前这么多推送，下一段才正好接在上一段结尾，既不空档也不会让上一段循环
 PUSH_LEAD = 0.7
 FIRST_FETCH_WAIT = 10.0  # 首段前可能压着小爱的本地回复，等久一点
@@ -342,7 +409,7 @@ async def _open_track(track: dict):
 
 
 async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: str,
-                           cache_key: str | None = None) -> bool:
+                           cache_key: str | None = None, loop: bool = False) -> bool:
     """顺序播放 tracks，每首边下边切片、按音箱真实播放起点接力推送，绕过 60 秒上限"""
     prefix = f"seg_{speaker.device_id[:8]}_{int(time() * 1000)}"
     entry = {
@@ -354,6 +421,7 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
         "paused_at": 0.0,
         "paused_total": 0.0,
         "skip": False,
+        "loop": loop,
     }
     _seg_playback[speaker.device_id] = entry
 
@@ -385,8 +453,14 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
             entry["first_ok"] = False
             entry["first_ready"].set()
 
+    cache_state = {"done": False}
+    prep_seq = 0
+
     async def prepare(track: dict, index: int):
         """打开一首歌并启动后台切片，返回 (分段队列, 生产者任务)"""
+        nonlocal prep_seq
+        seq = prep_seq
+        prep_seq += 1
         try:
             chunks = await _open_track(track)
         except Exception as e:
@@ -397,7 +471,7 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
             return None
 
         queue: asyncio.Queue = asyncio.Queue()
-        collect = bytearray() if (cache_key and index == 0) else None
+        collect = bytearray() if (cache_key and index == 0 and not cache_state["done"]) else None
 
         async def producer():
             n = 0
@@ -405,7 +479,7 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                 async for chunk, dur in chunks:
                     if entry["cancelled"]:
                         break
-                    chunk_url = write_chunk(f"{prefix}_{index}", n, chunk)
+                    chunk_url = write_chunk(f"{prefix}_{seq}", n, chunk)
                     n += 1
                     if collect is not None:
                         collect.extend(chunk)
@@ -413,6 +487,7 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                 else:
                     if collect is not None:
                         song_cache.put(cache_key, track.get("name", ""), track.get("artist", ""), bytes(collect))
+                        cache_state["done"] = True
             except asyncio.CancelledError:
                 raise
             except Exception as e:
@@ -504,10 +579,11 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
         upcoming = None
         no_prefetch = object()
         prefetched = no_prefetch
+        index = 0
+        misses = 0
         try:
-            for index, track in enumerate(tracks):
-                if entry["cancelled"]:
-                    return
+            while tracks and not entry["cancelled"]:
+                track = tracks[index]
                 if prefetched is no_prefetch:
                     prepared = await prepare(track, index)
                 else:
@@ -521,12 +597,23 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                         tracks[index] = alt
                         prepared = await prepare(alt, 1000 + index)
                 if prepared is None:
-                    # 这首放不了就跳过；保留 last，下一首仍接在上一首的尾巴后面
+                    # 这首放不了：循环模式连续失败两次就收工，免得原地空转
+                    misses += 1
+                    if entry["loop"] and misses >= 2:
+                        break
+                    if index + 1 < len(tracks):
+                        index += 1
+                    elif entry["loop"]:
+                        index = 0
+                    else:
+                        break
                     continue
 
                 start_at = None if last is None else last[0] + last[1] - PUSH_LEAD
                 if index + 1 < len(tracks):
                     upcoming = asyncio.create_task(prepare(tracks[index + 1], index + 1))
+                elif entry["loop"]:
+                    upcoming = asyncio.create_task(prepare(tracks[0], 0))
 
                 res = await play_track(prepared, track, index, start_at)
 
@@ -550,10 +637,19 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
                     last = None   # 下一首的首段已经在队列里，直接接上
                 else:
                     last = res
+                if res is not None:
+                    misses = 0
 
                 if upcoming is not None:
                     prefetched = await upcoming
                     upcoming = None
+
+                if index + 1 < len(tracks):
+                    index += 1
+                elif entry["loop"]:
+                    index = 0
+                else:
+                    break
 
             if last is None:
                 mark_first_failed()
@@ -577,6 +673,10 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
         finally:
             if upcoming is not None and not upcoming.done():
                 upcoming.cancel()
+            if prefetched is not no_prefetch and prefetched:
+                _, prefetch_task = prefetched
+                if not prefetch_task.done():
+                    prefetch_task.cancel()
             cleanup_chunks(prefix)
             if _seg_playback.get(speaker.device_id) is entry:
                 _seg_playback.pop(speaker.device_id, None)
@@ -594,7 +694,30 @@ async def _start_segmented(speaker: XiaoAiSpeaker, tracks: list[dict], title: st
 
 
 async def _resolve_tracks(keyword: str, artist_intent: bool = False) -> tuple[list[dict], str, str | None]:
-    """把点歌关键词变成待播列表；命中缓存直接播本地文件"""
+    """把点歌关键词变成待播列表；先查本地曲库，再查缓存，最后才搜索"""
+    local = local_music.lookup(keyword)
+    if not local:
+        aliased = music_aliases.resolve(keyword)
+        if aliased and aliased != keyword:
+            logger.info(f"歌名改写：{keyword} → {aliased}")
+            keyword = aliased
+            artist_intent = False
+            local = local_music.lookup(keyword)
+    preferred_artist = ""
+    descriptive = song_intent.is_descriptive(keyword)
+    playlist_request = _extract_playlist_artist(keyword) is not None
+    if not local and not (playlist_request or (artist_intent and not descriptive)):
+        inferred = await song_intent.infer(keyword, descriptive_only=False)
+        if inferred:
+            preferred_artist = inferred.get("artist", "")
+            if descriptive and inferred["title"] != keyword:
+                keyword = inferred["title"]
+                artist_intent = False
+                local = local_music.lookup(keyword)
+    if local:
+        logger.info(f"本地点播：{local['name']}，跳过搜索")
+        return [local], local["name"], None
+
     # 歌单诉求别命中单曲缓存，否则“来点周杰伦”会只剩上次缓存的那一首
     cached = None if artist_intent else song_cache.lookup(keyword)
     if cached:
@@ -612,7 +735,7 @@ async def _resolve_tracks(keyword: str, artist_intent: bool = False) -> tuple[li
             tracks = [{"url": url, "name": name, "artist": artist} for url, name in pairs]
             return tracks, f"{artist} 的歌", None
 
-    hit = await search_and_play(keyword)
+    hit = await search_and_play(keyword, prefer_artist=preferred_artist)
     if not hit:
         return [], keyword, None
     url, name = hit
@@ -637,8 +760,9 @@ async def _poll_loop(speaker: XiaoAiSpeaker, processed: set, state: dict):
                         and time() - state["last_reply_time"] < COOLDOWN)
                 )
 
-                # 检查是否是点歌指令（播放/放/来一首/听/搜索…）
-                music = _extract_music_keyword(query)
+                # 检查是否是点歌指令（播放/放/来一首/听/搜索…），
+                # “单曲循环播放 X”要先认出来，否则会被当成操作指令交给小爱原生循环
+                music = _extract_loop_music(query) or _extract_music_keyword(query)
 
                 operation_keywords = [
                     # 音乐/音频控制
@@ -682,9 +806,15 @@ async def _poll_loop(speaker: XiaoAiSpeaker, processed: set, state: dict):
                     finally:
                         processing = False
                 elif music:
-                    music_keyword, artist_intent = music
+                    if len(music) == 3:
+                        music_keyword, artist_intent, loop_mode = music
+                    else:
+                        music_keyword, artist_intent = music
+                        loop_mode = False
                     processing = True
-                    logger.info(f"[{speaker.name}] 点歌：{music_keyword}")
+                    logger.info(
+                        f"[{speaker.name}] {'单曲循环' if loop_mode else '点歌'}：{music_keyword}"
+                    )
 
                     _cancel_segments(speaker.device_id)
                     # 小爱原生服务通常已经抢先开播，先掐断再推我们的流
@@ -698,7 +828,9 @@ async def _poll_loop(speaker: XiaoAiSpeaker, processed: set, state: dict):
                                 f"[{speaker.name}] 找到歌曲：{title}"
                                 + (f"（{len(tracks)} 首）" if len(tracks) > 1 else "")
                             )
-                            played = await _start_segmented(speaker, tracks, title, cache_key)
+                            played = await _start_segmented(
+                                speaker, tracks, title, cache_key, loop=loop_mode
+                            )
                             if not played and tracks[0].get("url"):
                                 played = await speaker.play_audio_url(tracks[0]["url"])
                             if played:

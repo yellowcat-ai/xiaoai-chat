@@ -79,6 +79,7 @@ _BRACKETS = re.compile(r"[（(\[【].*?[）)\]】]")
 _VERSION_HINTS = (
     "伴奏", "伴唱", "翻唱", "cover", "live", "演唱会", "片段", "铃声", "dj", "remix",
     "纯音乐", "钢琴", "吉他", "口琴", "童声", "女声版", "男声版", "加速", "降调", "慢速",
+    "见面会", "现场版", "音乐节",
 )
 
 
@@ -97,7 +98,8 @@ def _artist_votes(songs: list[dict]) -> dict[str, int]:
     return votes
 
 
-def _score(song: dict, keyword: str, votes: dict[str, int] | None = None) -> float:
+def _score(song: dict, keyword: str, votes: dict[str, int] | None = None,
+           prefer_artist: str = "") -> float:
     """给候选打分：标题贴近关键词、时长完整、歌手在多源高频出现（原唱）分越高"""
     name = song.get("name", "")
     artist = song.get("artist", "")
@@ -135,6 +137,8 @@ def _score(song: dict, keyword: str, votes: dict[str, int] | None = None) -> flo
     for token in re.split(r"[\s,，、/]+", keyword):
         if len(token) >= 2 and token.lower() in artist.lower():
             score += 30
+    if prefer_artist and _artist_tokens(prefer_artist) & set(artists):
+        score += 35
     if votes and artists:
         # 取这首歌里最热门的那个歌手，避免合唱曲目把两个人的票叠加
         best = max(votes.get(a, 0) for a in artists)
@@ -142,9 +146,16 @@ def _score(song: dict, keyword: str, votes: dict[str, int] | None = None) -> flo
     return score
 
 
-def rank_songs(songs: list[dict], keyword: str, votes: dict[str, int] | None = None) -> list[dict]:
-    """按"像不像原版正曲"排序，同分保持搜索原始顺序"""
-    return sorted(songs, key=lambda s: -_score(s, keyword, votes))
+def rank_songs(songs: list[dict], keyword: str, votes: dict[str, int] | None = None,
+               prefer_artist: str = "") -> list[dict]:
+    """按"像不像原版正曲"排序，同分保持搜索原始顺序；有可信歌手时该歌手的版本优先"""
+    preferred = _artist_tokens(prefer_artist) if prefer_artist else set()
+
+    def key(song: dict):
+        matched = bool(preferred & _artist_tokens(song.get("artist", "")))
+        return (0 if matched or not preferred else 1, -_score(song, keyword, votes, prefer_artist))
+
+    return sorted(songs, key=key)
 
 
 def build_stream_url(song: dict) -> str:
@@ -324,12 +335,17 @@ def _artist_list(song: dict) -> list[str]:
     return [a.strip().lower() for a in re.split(r"[/、,，&+\s]+", song.get("artist", "")) if len(a.strip()) >= 2]
 
 
-def _pool_confident(songs: list[dict], keyword: str) -> bool:
+def _pool_confident(songs: list[dict], keyword: str, prefer_artist: str = "") -> bool:
     """候选里已经有一首足够像原唱的，就不必再等慢源"""
     if not songs:
         return False
+    # 推断出歌手时，先等到这位歌手的版本出现，避免同名不同曲抢先开播
+    if prefer_artist:
+        preferred = _artist_tokens(prefer_artist)
+        if not any(preferred & _artist_tokens(s.get("artist", "")) for s in songs):
+            return False
     votes = _artist_votes(songs)
-    top = rank_songs(songs, keyword, votes)[0]
+    top = rank_songs(songs, keyword, votes, prefer_artist)[0]
     name = top.get("name", "")
     if _norm(name) != _norm(keyword) or _BRACKETS.search(name):
         return False
@@ -343,41 +359,52 @@ def _pool_confident(songs: list[dict], keyword: str) -> bool:
     return max((votes.get(a, 0) for a in _artist_list(top)), default=0) >= 2
 
 
-def _early_candidate(songs: list[dict], keyword: str) -> list[dict] | None:
+def _early_candidate(songs: list[dict], keyword: str, prefer_artist: str = "") -> list[dict] | None:
     """候选是否足够靠谱到可以提前开播：标题完全一致、不是 Live/翻唱等版本、歌手已有多源印证"""
-    if not _pool_confident(songs, keyword):
+    if not _pool_confident(songs, keyword, prefer_artist):
         return None
-    return rank_songs(songs, keyword, _artist_votes(songs))
+    return rank_songs(songs, keyword, _artist_votes(songs), prefer_artist)
 
 
-async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, str] | None:
+async def search_and_play(keyword: str, source: str = "netease",
+                          prefer_artist: str = "") -> tuple[str, str] | None:
     """并发搜索所有源；出现高置信候选就提前开播，4 秒后还不够靠谱就再等 3 秒慢源"""
     sources = ["migu", "netease", "qq", "kugou", "qianqian", "kuwo"]  # 咪咕打平时优先
 
+    # 有可信歌手时同时搜「歌名」和「歌名+歌手」：
+    # 日文/外文原曲在中文源里常登记成原名，只搜译名找不到原唱
+    queries = [keyword]
+    if prefer_artist:
+        queries.append(f"{keyword} {prefer_artist}")
+
     logger.info(f"并发搜索 {len(sources)} 个源 (优先级: {', '.join(sources)})...")
 
-    tasks = [asyncio.create_task(search_songs(keyword, source=src, max_results=8)) for src in sources]
+    tasks = [(src, asyncio.create_task(search_songs(q, source=src, max_results=8)))
+             for q in queries for src in sources]
     results: dict[str, list[dict]] = {}
     loop = asyncio.get_running_loop()
     deadline = loop.time() + 4.0
     hard_deadline = deadline + 3.0
 
     def collect(finished):
-        for src, task in zip(sources, tasks):
+        for src, task in tasks:
             if task in finished and not task.cancelled() and task.exception() is None:
                 songs = task.result() or []
-                if songs:
-                    results[src] = songs
+                if not songs:
+                    continue
+                merged = results.setdefault(src, [])
+                seen = {(s.get("id"), s.get("source")) for s in merged}
+                merged.extend(s for s in songs if (s.get("id"), s.get("source")) not in seen)
 
     try:
-        pending = set(tasks)
+        pending = {task for _, task in tasks}
         early_fallback = None
         early_checked = False
         while pending and loop.time() < hard_deadline:
             if loop.time() >= deadline:
                 # 已过基础等待时间：候选够靠谱就直接收工，否则再给慢源一点时间
                 pool_now = [s for songs in results.values() for s in songs]
-                if _pool_confident(pool_now, keyword):
+                if _pool_confident(pool_now, keyword, prefer_artist):
                     break
             done, pending = await asyncio.wait(pending, timeout=0.4)
             collect(done)
@@ -386,7 +413,8 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
             if early_checked or len(results) < 3:
                 continue
             early_checked = True
-            early = _early_candidate([s for songs in results.values() for s in songs], keyword)
+            early = _early_candidate([s for songs in results.values() for s in songs], keyword,
+                                     prefer_artist)
             if not early:
                 continue
             mp3_hit, early_fallback = await _check_group(early[:3])
@@ -395,7 +423,7 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
                 logger.info(f"提前命中 MP3 歌曲: {name} (源: {src_name})")
                 return url, name
     finally:
-        for task in tasks:
+        for _, task in tasks:
             if not task.done():
                 task.cancel()
 
@@ -406,11 +434,18 @@ async def search_and_play(keyword: str, source: str = "netease") -> tuple[str, s
     # 跨源汇总后统一打分：原唱在多个源反复出现，分数自然更高
     pool = [song for songs in results.values() for song in songs]
     votes = _artist_votes(pool)
+    preferred = _artist_tokens(prefer_artist) if prefer_artist else set()
     candidates = []
     for src in sources:
         for song in results.get(src, []):
-            candidates.append((-_score(song, keyword, votes), sources.index(src), song))
-    candidates.sort(key=lambda item: (item[0], item[1]))
+            candidates.append((-_score(song, keyword, votes, prefer_artist), sources.index(src), song))
+
+    def sort_key(item):
+        _, src_idx, song = item
+        matched = bool(preferred & _artist_tokens(song.get("artist", "")))
+        return (0 if matched or not preferred else 1, item[0], src_idx)
+
+    candidates.sort(key=sort_key)
 
     # 全都没沾上标题/歌手（比如搜不存在的歌名时源站的模糊结果），宁可不放
     if -candidates[0][0] < 30:
