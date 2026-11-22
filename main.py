@@ -715,7 +715,7 @@ async def _resolve_tracks(keyword: str, artist_intent: bool = False) -> tuple[li
         inferred = await song_intent.infer(keyword, descriptive_only=False)
         if inferred:
             preferred_artist = inferred.get("artist", "")
-            if descriptive and inferred["title"] != keyword:
+            if inferred["title"] != keyword:
                 keyword = inferred["title"]
                 artist_intent = False
                 local = local_music.lookup(keyword)
