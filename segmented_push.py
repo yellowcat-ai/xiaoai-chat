@@ -8,7 +8,7 @@ from pathlib import Path
 
 import aiohttp
 
-from tts_engine import TTS_DIR, ensure_server, public_url
+from tts_engine import TTS_DIR, ensure_server, ensure_tts_dir, public_url
 
 logger = logging.getLogger(__name__)
 
@@ -265,6 +265,7 @@ async def stream_mp3_chunks(url: str, chunk_seconds: float = 50.0, timeout: floa
 
 def write_chunk(prefix: str, index: int, chunk: bytes) -> Path:
     """写入一段音频并返回可访问 URL"""
+    ensure_tts_dir()
     ensure_server()
     path = Path(TTS_DIR) / f"{prefix}_{index:03d}.mp3"
     path.write_bytes(chunk)
@@ -273,6 +274,7 @@ def write_chunk(prefix: str, index: int, chunk: bytes) -> Path:
 
 def publish_chunks(chunks: list[bytes], prefix: str) -> list[str]:
     """把分段写入本地 HTTP 目录，返回可访问 URL 列表"""
+    ensure_tts_dir()
     ensure_server()
     urls = []
     for i, chunk in enumerate(chunks):

@@ -15,7 +15,20 @@ from mutagen.mp3 import MP3
 logger = logging.getLogger(__name__)
 
 TTS_DIR = Path(tempfile.gettempdir()) / "xiaoai_tts"
-TTS_DIR.mkdir(exist_ok=True)
+
+
+def ensure_tts_dir() -> Path:
+    """%TEMP% 下的目录随时可能被存储感知/磁盘清理删掉
+
+    只在模块导入时建一次是不够的：进程长期运行时目录一旦消失，
+    之后所有 write_bytes 都抛 FileNotFoundError，表现为切片失败、
+    首段推送超时、TTS 全部生成失败。所以每次写入前都补齐。
+    """
+    TTS_DIR.mkdir(parents=True, exist_ok=True)
+    return TTS_DIR
+
+
+ensure_tts_dir()
 
 TTS_VOICE = "zh-CN-XiaoxiaoNeural"
 
@@ -99,6 +112,7 @@ def public_url(filename: str) -> str:
 async def generate_tts(text: str, retries: int = 3) -> tuple[str, float] | None:
     """用 edge-tts 生成 MP3 文件，返回 (URL, 时长秒数)"""
     _start_server()
+    ensure_tts_dir()
 
     filename = f"tts_{hash(text) & 0xFFFFFFFF}.mp3"
     filepath = TTS_DIR / filename
@@ -151,6 +165,7 @@ async def get_silence_url() -> str | None:
 
     silence_path = TTS_DIR / "silence.mp3"
     if not silence_path.exists():
+        ensure_tts_dir()
         # 生成有效的静音 MP3 (MPEG1 Layer3, 48kbps, 24kHz, mono)
         # 每帧 144 字节，约 72ms，生成约 2 秒静音
         frame_header = bytes([0xFF, 0xFB, 0x60, 0xC4])
