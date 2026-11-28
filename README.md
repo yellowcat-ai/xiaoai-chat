@@ -81,15 +81,19 @@ music-dl.exe web --no-browser
 
 `--no-browser` 是不自动弹浏览器。默认监听 `http://localhost:8080/music`，浏览器能打开搜索页就说明好了。要常驻可以放 Docker，或者注册成系统服务开机自启。
 
+本仓库自带的做法是 `watchdog.ps1` + Windows 计划任务（任务名 `XiaoAiChatWatchdog`，每分钟巡检一次）：两个进程都在它的托管范围内，music-dl 掉了会重新拉起，主程序掉了也会。夜间 23:00–07:00 主动停掉主程序，避免半夜自己续播。
+
 ### 2. 接口约定
 
-本项目只用到它的两个接口，都是纯 HTTP：
+本项目只用到它的三个接口，都是纯 HTTP：
 
 ```
-GET /music/search?q=关键词&source=migu&type=song&page=1   返回搜索结果页（HTML）
-GET /music/download?id=...&source=...&stream=1            返回音频流
-GET /music/inspect?id=...&source=...                      返回解析结果（JSON）
+GET /music/search?q=关键词&type=song&page=1                返回搜索结果页（HTML，各平台聚合）
+GET /music/download?id=...&source=...&stream=1             返回音频流
+GET /music/inspect?id=...&source=...                       返回解析结果（JSON）
 ```
+
+注意 go-music-dl 1.1.x 的搜索是**多平台聚合**：一次请求就返回 migu / qq / kuwo / qianqian / netease 的混合结果，`source` 参数不再生效。所以 `music_search.py` 只请求一次，再按每条结果的 `data-source` 在本地分平台筛选，并按 60 秒 TTL 缓存、合并并发请求。
 
 `/music/inspect` 用来确认选中的歌真能放、不是只有几秒的试听片段，接口不可用时自动退回字节探测。
 

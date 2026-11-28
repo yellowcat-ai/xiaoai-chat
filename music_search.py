@@ -7,6 +7,8 @@ import socket
 from html.parser import HTMLParser
 from urllib.parse import parse_qs, quote, urlencode, urlparse, urlunparse
 
+from time import monotonic
+
 import aiohttp
 
 from segmented_push import mp3_bitrate_head, mp3_duration_head
@@ -28,6 +30,11 @@ def _get_local_ip():
 _local_ip = _get_local_ip()
 MUSIC_DL_BASE = f"http://{_local_ip}:8080/music"
 MUSIC_DL_LOCAL = "http://localhost:8080/music"
+
+# 聚合搜索的短期缓存：同一关键词在多源并发时只打一次 music-dl
+_AGG_TTL = 60.0
+_agg_cache: dict[str, tuple[float, list[dict]]] = {}
+_inflight: dict[str, asyncio.Future] = {}
 
 
 class SongCardParser(HTMLParser):
@@ -56,25 +63,55 @@ class SongCardParser(HTMLParser):
             self.current_song = None
 
 
+async def _search_all(keyword: str) -> list[dict]:
+    """取一次聚合搜索的全部结果（各平台混在一起）
+
+    go-music-dl 1.1.x 起搜索改为「多平台聚合」，`source` 参数不再生效：
+    一次请求就返回 migu/apple/qq/netease/kuwo/qianqian 的混合结果。
+    缓存 + in-flight 合并，避免 6 个源并发时对同一关键词重复请求。
+    """
+    cached = _agg_cache.get(keyword)
+    if cached and monotonic() - cached[0] < _AGG_TTL:
+        return cached[1]
+
+    running = _inflight.get(keyword)
+    if running is not None:
+        return await running
+
+    fut = asyncio.get_running_loop().create_future()
+    _inflight[keyword] = fut
+    songs: list[dict] = []
+    try:
+        url = f"{MUSIC_DL_LOCAL}/search?q={quote(keyword)}&type=song&page=1"
+        async with aiohttp.ClientSession() as session:
+            async with session.get(url, timeout=aiohttp.ClientTimeout(total=15)) as resp:
+                if resp.status == 200:
+                    html = await resp.text()
+                    parser = SongCardParser()
+                    parser.feed(html)
+                    songs = parser.songs
+                else:
+                    logger.debug(f"聚合搜索返回 {resp.status}")
+    except Exception as e:
+        logger.debug(f"聚合搜索失败: {keyword} - {e}")
+    finally:
+        _inflight.pop(keyword, None)
+        if not fut.done():
+            fut.set_result(songs)
+
+    if songs:
+        if len(_agg_cache) > 50:
+            _agg_cache.clear()
+        _agg_cache[keyword] = (monotonic(), songs)
+    return songs
+
+
 async def search_songs(keyword: str, source: str = "netease", max_results: int = 5) -> list[dict]:
-    """搜索歌曲，返回歌曲列表"""
-    url = f"{MUSIC_DL_LOCAL}/search?q={quote(keyword)}&source={source}&type=song&page=1"
-    async with aiohttp.ClientSession() as session:
-        try:
-            async with session.get(url, timeout=aiohttp.ClientTimeout(total=10)) as resp:
-                if resp.status != 200:
-                    logger.debug(f"搜索 {source} 返回 {resp.status}")
-                    return []
-                html = await resp.text()
-                parser = SongCardParser()
-                parser.feed(html)
-                # 过滤指定源
-                songs = [s for s in parser.songs if s.get("source") == source]
-                logger.info(f"搜索 '{keyword}' (源: {source}) 找到 {len(songs)} 首歌曲")
-                return songs[:max_results]
-        except Exception as e:
-            logger.debug(f"搜索 {source} 失败：{e}")
-            return []
+    """按平台取搜索结果：聚合结果里筛出属于该平台的条目"""
+    songs = await _search_all(keyword)
+    picked = [s for s in songs if s.get("source") == source]
+    logger.info(f"搜索 '{keyword}' (源: {source}) 找到 {len(picked)} 首歌曲，聚合共 {len(songs)} 首")
+    return picked[:max_results]
 
 
 _BRACKETS = re.compile(r"[（(\[【].*?[）)\]】]")
